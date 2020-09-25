@@ -1,0 +1,290 @@
+<!--
+  This application is requesting data sampled on analog input A0 of ESP8266
+  to be then displayed on-line in a web brower 
+
+  Flie: WebSocket-Scope.html by krzychb at gazeta.pl
+  Rev: 1.0.0 on 4-Mar-2016
+  
+  To make it run you need another application 
+  to send request for data using web sockets
+
+  Copyright (c) 2016 Krzysztof Budzynski. All rights reserved.
+  This file is part of OnlineHumidifier project - https://github.com/krzychb/OnlineHumidifier
+
+  This library is free software; you can redistribute it and/or
+  modify it under the terms of the GNU Lesser General Public
+  License as published by the Free Software Foundation; either
+  version 2.1 of the License, or (at your option) any later version.
+
+  This library is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+  Lesser General Public License for more details.
+
+  You should have received a copy of the GNU Lesser General Public
+  License along with this library; if not, write to the Free Software
+  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+-->
+
+<!DOCTYPE html>
+<html>
+<head>
+<title>Web Socket Scope rev. 1.0.0</title>
+<!-- get file below from http://canvasjs.com/ and place in the same folder as this file -->
+<script type="text/javascript" src="canvasjs.min.js"></script>
+</head>
+<body>
+
+<div id="chartScope" style="height: 400px; width: 100%;"></div>
+
+<div id="chartThroughput" style="height: 400px; width: 60%; float:left"></div>
+<div id="controlPanel" style="float:right; font-family: Arial">
+Treshold: <input id="sliderTreshold" value="0" type="range" min="0" max="1024" step="1" style="width: 200px" onchange="changeTreshold()" /><br/>
+Sample Size: <input id="sliderSampleSize" value="100" type="range" min="1" max="512" step="1" style="width: 200px" onchange="changeSampleSize()" /><br/>
+<h3>Communication Diagnostics</h3>
+Roundtrip Time: <input type="text" id="roundtripTime" size="4" value="-" /> ms<br/>
+Message Count: <input type="text" id="messageCount" size="6" value="-" /><br/>
+Missed Replies: <input type="text" id="missedReplies" size="6" value="-" /><br/>
+<form onsubmit="return false;">
+Host:<input type="text" id="hostName" value="ws://192.168.1.103:81" style="width:160px;"/>
+<input type="button" value="Connect" onclick="connect(hostName.value)" />
+<input type="button" value="Disconnect" onclick="disconnect()" /><br/>
+Status:<input type="text" id="connectionStatus" value="Idle" />
+Pings:<input type="text" id="connectionPings" size="6" value="-" /><br/>
+<textarea id="messageWindow" rows="5" cols="40">Message here...</textarea>
+</form>
+Message Size: <input type="text" id="messageSize" size="9" value="-" /> Bytes<br/>
+Throughput: <input type="text" id="throughput" size="9" value="-" /> KB/s
+</div>
+
+<script type="text/javascript">
+var roundtripTime = document.getElementById('roundtripTime');
+var roundtripTimeSamples = [];
+var ROUNDTRIP_TIME_SAMPLES = 50;
+var messageCount = document.getElementById('messageCount');
+var missedReplies = document.getElementById('missedReplies');
+var messageCounter = 0;
+var missedMessageCounter = 0;
+var messageSendMilis;
+
+var sliderTreshold = document.getElementById('sliderTreshold');
+var sampleTreshold = parseInt(sliderTreshold.value);
+var sliderSampleSize = document.getElementById('sliderSampleSize');
+var sampleSize = parseInt(sliderSampleSize.value);;
+
+var connection;
+var connectionStatus = document.getElementById('connectionStatus');
+var connectionPings = document.getElementById('connectionPings');
+var hostName = document.getElementById('hostName');
+var messageWindow = document.getElementById('messageWindow');
+var messageSize = document.getElementById('messageSize');
+var throughput = document.getElementById('throughput');
+var extraPayload = ""; 
+
+var pingCounter = 0;
+var sendPingVar;
+var dateObject; 
+
+messageCount.value = messageCounter;
+missedReplies.value = missedMessageCounter;
+
+
+// Chart configuration - Scope
+var scopeSamples = [];   // primary Y axis
+var chartScope;
+// wrap "new CanvasJS.Chart" into a function
+// to be able movea stripLines by calling it
+function setupScopeChart()
+{
+	chartScope = new CanvasJS.Chart("chartScope",
+	{
+		title: {text: "ESP8266 Analog Input Scope"},
+		axisX: {title: "Sample Number"},
+		axisY: {title: "A0 Counts", stripLines:[ {startValue:sampleTreshold-1, endValue:sampleTreshold+1, color:"green", label : "Treshold", labelFontColor: "green" }]},
+		data: [{type: "line", dataPoints : scopeSamples}]
+	});
+	chartScope.render();
+}
+setupScopeChart();
+
+
+// Chart configuration - Web Socket Throughput
+var dpsp = [];   // primary Y axis
+var dpss = [];   // secondary Y axis
+var chartThroughput = new CanvasJS.Chart("chartThroughput",
+{
+	title: {text: "Web Socket Throughput"},
+	legend:{horizontalAlign: "right", verticalAlign: "top" },
+	axisX: {title: "Message Number"},
+	axisY2: {title: "Throughput [KB/s]", includeZero: false },
+	axisY: {title: "Roundtrip Time [ms]", includeZero: false },
+	data: [
+		{type: "line", showInLegend: true, legendText: "Roundtrip Time", dataPoints : dpsp},
+		{type: "line", showInLegend: true, legendText: "Throughput", axisYType: "secondary", dataPoints : dpss}
+	]
+});
+chartThroughput.render();
+
+function connect(host)
+{
+	if(connection)
+	{
+		connection.close();
+	}
+
+	connectionStatus.value = "Connecting..."
+	connection = new WebSocket(host, ['arduino']);
+
+	connection.onopen = function() 
+	{
+		connectionStatus.value = "Connected";
+		connectionStatus.style = "background-color:lightgreen";
+		connection.send('Hallo from Browser :-) ' + new Date()); 
+		sendMessage();
+		sendPingVar = setInterval(function(){ sendPing() }, 60000);
+	};
+
+	connection.onclose = function(event)
+	{
+		clearInterval(sendPingVar);
+		connectionStatus.value = "Disconnected";
+		connectionStatus.style = "background-color:red";
+		connection.removeAllListeners();
+		connection = null;
+	};
+
+	connection.onerror = function(error) 
+	{
+		console.log("WebSocket Error ", error);
+	};
+
+	connection.onmessage = function(message)
+	{
+		var fileds = message.data.split(" ");
+
+		// show message
+		messageWindow.value = message.data;
+		messageSize.value = message.data.length;
+
+		// check only messages begining with '#'
+		if(fileds[0] == "#")
+		{
+			if(fileds[1] !=  messageCounter)
+			{
+				missedMessageCounter++;
+				missedReplies.value = missedMessageCounter;
+				connection.close();
+			}
+			else
+			{
+				dateObject = new Date();
+				var rtt = dateObject.getTime() - messageSendMilis;
+
+				// send another message
+				// this is assuming that processing below takes shorteer
+				// than the time for this message to bounce back
+				sendMessage();
+
+				// update Scope chart
+				var analogSamples = fileds[2].split(";");
+				if(parseInt(analogSamples[0]) == -1)
+				{
+					// waiting for the trigger
+				}
+				else
+				{
+					scopeSamples.length = 0;
+					for(var i=0; i < analogSamples.length; i++)
+					{
+						scopeSamples.push({x: i, y: parseInt(analogSamples[i])});
+					}
+					chartScope.render();
+				}
+				
+				// maintain table with Roundtrip Time Samples
+				roundtripTime.value = rtt;
+				roundtripTimeSamples.push(rtt);
+				if (roundtripTimeSamples.length >  ROUNDTRIP_TIME_SAMPLES)
+				{
+					roundtripTimeSamples.shift();				
+				}
+				// update Throughput chart
+				if(messageCounter % ROUNDTRIP_TIME_SAMPLES == 0)
+				{
+					// Y axis - roundtrip time
+					// calculate running average of message roundtrip time
+					rtt = 0;	
+					for(var i in roundtripTimeSamples)
+					{
+						rtt = rtt + roundtripTimeSamples[i];
+					}
+					rtt = rtt / roundtripTimeSamples.length;
+					// Primary Y axis
+					dpsp.push({x: messageCounter, y: rtt});
+					// calculate throughput in KB/s
+					// average roundtrip time in ms - multiply by 1000
+					// roundtrip to device and back - divide by 2
+					// Kilo Bytes - divide by 1024
+					var avgt = 0.488 * parseInt(messageSize.value) / rtt;
+					// Secondary Y axis
+					dpss.push({x: messageCounter, y: avgt});
+					throughput.value = avgt.toFixed(2);
+					// hold the last 100 values for the chart
+					if (dpsp.length >  100)
+					{
+						dpsp.shift();
+						dpss.shift();
+					}
+					chartThroughput.render();
+				}
+			}
+		}
+	};
+}
+
+function disconnect()
+{
+	if(connection)
+	{
+		connection.close();
+	}
+	else
+	{
+		connectionStatus.value = "Not connected yet";
+	}
+}
+
+function sendMessage()
+{
+	messageCounter++;
+	messageCount.value = messageCounter;
+	dateObject = new Date();
+	messageSendMilis = dateObject.getTime();
+	//
+    // Message format
+    // # MESSAGE_NUMBER SAMPLE_TRESHOLD NUMBER_OF_SAMPLES
+	//
+	connection.send("# " + messageCounter + " " + sampleTreshold + " " + sampleSize);
+}
+
+function sendPing()
+{
+	connection.send('ping');
+	pingCounter++;
+	connectionPings.value = pingCounter;
+}
+
+function changeTreshold()
+{
+	sampleTreshold = parseInt(sliderTreshold.value);
+	setupScopeChart();
+}
+
+function changeSampleSize()
+{
+	sampleSize = parseInt(sliderSampleSize.value);
+}
+
+</script>
+</body>
+</html>
